@@ -32,10 +32,11 @@ const textEncoder = new TextEncoder();
  * @return {Uint8Array<ArrayBuffer>}
  */
 const toUint8Array = (value) => {
-  if (value === undefined) return new Uint8Array(0);
-  else if (typeof value === 'string') return textEncoder.encode(value);
-  else if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  else return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (value === undefined) return EMPTY_U8;
+  if (typeof value === 'string') return Buffer.from(value);
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 };
 
 module.exports.DeclarativeResponse = class DeclarativeResponse {
