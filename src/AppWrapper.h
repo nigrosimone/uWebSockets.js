@@ -21,6 +21,61 @@
 using namespace v8;
 
 /* uWS.App.ws('/pattern', behavior) */
+/* A DeclarativeResponse with nothing taken from the request, framed once; null when a part is dynamic */
+static std::shared_ptr<uWS::PreformattedResponse> preformatDeclarativeResponse(std::string_view instructions) {
+    std::string status = "200 OK", headers, body;
+    while (instructions.length()) {
+        switch (instructions[0]) {
+            case 0: case 5: {
+                /* END, WRITE */
+                uint16_t length;
+                memcpy(&length, instructions.data() + 1, 2);
+                instructions.remove_prefix(3);
+                body.append(instructions.substr(0, length));
+                instructions.remove_prefix(length);
+            }
+            break;
+            case 1: {
+                /* WRITE_HEADER */
+                uint8_t keyLength;
+                memcpy(&keyLength, instructions.data() + 1, 1);
+                instructions.remove_prefix(2);
+                std::string_view key = instructions.substr(0, keyLength);
+                instructions.remove_prefix(keyLength);
+                uint8_t valueLength;
+                memcpy(&valueLength, instructions.data(), 1);
+                instructions.remove_prefix(1);
+                std::string_view value = instructions.substr(0, valueLength);
+                instructions.remove_prefix(valueLength);
+                headers.append(key).append(": ").append(value).append("\r\n");
+            }
+            break;
+            case 2: {
+                /* WRITE_BODY, a no-op */
+                instructions.remove_prefix(1);
+            }
+            break;
+            case 7: {
+                /* WRITE_STATUS */
+                uint8_t statusLength;
+                memcpy(&statusLength, instructions.data() + 1, 1);
+                instructions.remove_prefix(2);
+                status = std::string(instructions.substr(0, statusLength));
+                instructions.remove_prefix(statusLength);
+            }
+            break;
+            default:
+                /* a value taken from the request */
+                return nullptr;
+        }
+    }
+    auto preformatted = std::make_shared<uWS::PreformattedResponse>();
+    preformatted->head = "HTTP/1.1 " + status + "\r\n" + headers;
+    preformatted->tail = "Content-Length: " + std::to_string(body.length()) + "\r\n\r\n" + body;
+    preformatted->bodyLength = body.length();
+    return preformatted;
+}
+
 template <typename APP>
 void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
 
@@ -338,13 +393,25 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
             return;
         }
 
-        (app->*f)(std::string(pattern.getString()), [response = std::string(constantString.getString().data(), constantString.getString().length())](auto *res, auto *req) {
+        std::string instructions(constantString.getString().data(), constantString.getString().length());
+        std::shared_ptr<uWS::PreformattedResponse> preformatted = preformatDeclarativeResponse(instructions);
+
+        (app->*f)(std::string(pattern.getString()), [response = std::move(instructions), preformatted](auto *res, auto *req) {
             
 
             if constexpr (!std::is_same<APP, uWS::H3App>::value) {
 
+                /* Nothing taken from the request: the frame made ahead of time, in one write */
+                if (preformatted && req->getCaseSensitiveMethod() != "HEAD" && res->tryEndPreformatted(*preformatted)) {
+                    return;
+                }
+
                 /* Parse the DeclarativeResponse */
                 std::string_view remainingInstructions(response.data(), response.length());
+
+                /* What is written before END goes out with it in one piece, so the response has a
+                 * Content-Length; res->write() would frame it as chunked */
+                std::string body;
                 while (remainingInstructions.length()) {
                     switch(remainingInstructions[0]) {
                         case 0: {
@@ -353,7 +420,12 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
                             memcpy(&length, remainingInstructions.data() + 1, 2);
                             remainingInstructions.remove_prefix(3); // Skip opCode and length bytes
                             
-                            res->end(remainingInstructions.substr(0, length));
+                            if (body.empty()) {
+                                res->end(remainingInstructions.substr(0, length));
+                            } else {
+                                body.append(remainingInstructions.substr(0, length));
+                                res->end(body);
+                            }
                             remainingInstructions.remove_prefix(length);
                         }
                         break;
@@ -391,7 +463,7 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
                             std::string_view keyString(remainingInstructions.data(), keyLength);
                             remainingInstructions.remove_prefix(keyLength);
 
-                            res->write(req->getQuery(keyString));
+                            body.append(req->getQuery(keyString));
                         }
                         break;
                         case 4: {
@@ -403,7 +475,7 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
                             std::string_view keyString(remainingInstructions.data(), keyLength);
                             remainingInstructions.remove_prefix(keyLength);
 
-                            res->write(req->getHeader(keyString));
+                            body.append(req->getHeader(keyString));
                         }
                         break;
                         case 5: {
@@ -415,7 +487,7 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
                             std::string_view valueString(remainingInstructions.data(), length);
                             remainingInstructions.remove_prefix(length);
 
-                            res->write(valueString);
+                            body.append(valueString);
                         }
                         break;
                         case 6: {
@@ -427,7 +499,7 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
                             std::string_view keyString(remainingInstructions.data(), keyLength);
                             remainingInstructions.remove_prefix(keyLength);
 
-                            res->write(req->getParameter(keyString));
+                            body.append(req->getParameter(keyString));
                         }
                         break;
                         case 7: {
